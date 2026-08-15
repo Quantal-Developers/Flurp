@@ -22,6 +22,26 @@ uvicorn app:app --reload
 Open <http://127.0.0.1:8000>. The prototype stores its SQLite database under
 `data/` and PDFs under `uploads/`; both are ignored by Git.
 
+## Run with Docker
+
+```bash
+docker compose up --build -d
+docker compose ps
+```
+
+Open <http://127.0.0.1:8000>. The application is bound to localhost and is
+not reachable from other machines by default. SQLite data and uploaded PDFs
+are retained in the `flurp_data` and `flurp_uploads` named volumes.
+
+```bash
+docker compose logs -f flurp
+docker compose down
+```
+
+`docker compose down` stops the service without deleting filings or database
+data. Use `docker compose down --volumes` only when you intentionally want to
+remove the prototype's local data.
+
 ## Workflow
 
 1. Upload one DRHP/RHP PDF and record its filing date.

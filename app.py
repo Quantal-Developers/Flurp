@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import sqlite3
 from contextlib import asynccontextmanager, closing
 from datetime import date, datetime, timezone
@@ -23,6 +24,10 @@ from pydantic import BaseModel, Field
 DATABASE_PATH = Path(os.getenv("FLURP_DATABASE_PATH", "data/flurp.db"))
 UPLOAD_DIRECTORY = Path("uploads")
 DOCUMENT_TYPES = {"DRHP", "RHP"}
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+UPLOAD_CHUNK_BYTES = 1024 * 1024
+PDF_HEADER = b"%PDF-"
+PDF_HEADER_SCAN_WINDOW = 1024
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -120,13 +125,27 @@ class OutreachStateChange(BaseModel):
     note: str | None = Field(default=None, max_length=1000)
 
 
+OUTREACH_TRANSITIONS: dict[str, set[str]] = {
+    "draft": {"approved", "opted_out"},
+    "approved": {"sent", "opted_out"},
+    "sent": {"replied", "bounced", "opted_out"},
+    "replied": {"opted_out"},
+    "bounced": set(),
+    "opted_out": set(),
+}
+
+
+def _has_word(text: str, phrase: str) -> bool:
+    return re.search(rf"\b{re.escape(phrase)}\b", text) is not None
+
+
 def role_points(role: str) -> int:
     lower = role.lower()
-    if any(word in lower for word in ("chief", "ceo", "cfo", "coo", "cto", "founder", "managing director")):
+    if any(_has_word(lower, word) for word in ("chief", "ceo", "cfo", "coo", "cto", "founder", "managing director")):
         return 25
-    if any(word in lower for word in ("vice president", "vp", "director", "head of")):
+    if any(_has_word(lower, word) for word in ("vice president", "vp", "director", "head of")):
         return 18
-    if any(word in lower for word in ("manager", "lead", "principal")):
+    if any(_has_word(lower, word) for word in ("manager", "lead", "principal")):
         return 10
     return 5
 
@@ -144,13 +163,12 @@ def share_points(disclosed_shares: int | None) -> int:
 
 
 def freshness_points(filing_date: str) -> tuple[int, bool]:
-    days_old = max(0, (date.today() - date.fromisoformat(filing_date)).days)
+    """"Fresh" per the V1 data contract is within 72 hours (3 days); older is stale."""
+    days_old = (date.today() - date.fromisoformat(filing_date)).days
     if days_old <= 1:
         return 15, False
     if days_old <= 3:
         return 10, False
-    if days_old <= 7:
-        return 5, False
     return 0, True
 
 
@@ -197,11 +215,34 @@ def health() -> dict[str, str]:
 @app.get("/api/documents")
 def list_documents() -> list[dict]:
     with closing(connection()) as db:
-        return [dict(row) for row in db.execute("SELECT * FROM source_documents ORDER BY filing_date DESC").fetchall()]
+        rows = db.execute(
+            """SELECT id, issuer, document_type, filing_date, original_filename, sha256, page_count, created_at
+               FROM source_documents ORDER BY filing_date DESC"""
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def _read_upload_within_limit(upload: UploadFile, limit: int) -> bytes:
+    """Read the underlying file synchronously, aborting as soon as the running
+    total exceeds the limit instead of buffering an unbounded body first."""
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = upload.file.read(UPLOAD_CHUNK_BYTES)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            raise HTTPException(
+                status_code=422,
+                detail=f"The PDF exceeds the {limit // (1024 * 1024)}MB upload limit",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 @app.post("/api/documents/upload", status_code=status.HTTP_201_CREATED)
-async def upload_document(
+def upload_document(
     issuer: Annotated[str, Form(min_length=2, max_length=160)],
     document_type: Annotated[str, Form()],
     filing_date: Annotated[date, Form()],
@@ -209,20 +250,34 @@ async def upload_document(
 ) -> dict:
     if document_type not in DOCUMENT_TYPES:
         raise HTTPException(status_code=422, detail="document_type must be DRHP or RHP")
+    if filing_date > date.today():
+        raise HTTPException(status_code=422, detail="filing_date cannot be in the future")
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=422, detail="A PDF filing is required")
 
-    content = await file.read()
+    content = _read_upload_within_limit(file, MAX_UPLOAD_BYTES)
     if not content:
         raise HTTPException(status_code=422, detail="The uploaded PDF is empty")
+    if PDF_HEADER not in content[:PDF_HEADER_SCAN_WINDOW]:
+        raise HTTPException(status_code=422, detail="The file is not a readable PDF")
     digest = hashlib.sha256(content).hexdigest()
     try:
         pdf = fitz.open(stream=content, filetype="pdf")
-        extracted_text = "\n".join(page.get_text() for page in pdf)
-        page_count = pdf.page_count
-        pdf.close()
     except (fitz.FileDataError, RuntimeError) as error:
         raise HTTPException(status_code=422, detail="The file is not a readable PDF") from error
+    try:
+        if pdf.is_encrypted:
+            raise HTTPException(
+                status_code=422,
+                detail="Password-protected or encrypted PDFs are not supported in V1",
+            )
+        try:
+            extracted_text = "\n".join(page.get_text() for page in pdf)
+        except Exception as error:
+            raise HTTPException(status_code=422, detail="The file is not a readable PDF") from error
+        page_count = pdf.page_count
+    finally:
+        pdf.close()
     if not extracted_text.strip():
         raise HTTPException(status_code=422, detail="The PDF has no extractable text; OCR is not in V1")
 
@@ -233,11 +288,19 @@ async def upload_document(
         if existing:
             raise HTTPException(status_code=409, detail=f"This document is already recorded as {existing['id']}")
         stored_path.write_bytes(content)
-        db.execute(
-            "INSERT INTO source_documents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (identifier, issuer.strip(), document_type, filing_date.isoformat(), file.filename, str(stored_path), digest, page_count, extracted_text, utc_now()),
-        )
-        db.commit()
+        try:
+            db.execute(
+                "INSERT INTO source_documents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (identifier, issuer.strip(), document_type, filing_date.isoformat(), file.filename, str(stored_path), digest, page_count, extracted_text, utc_now()),
+            )
+            db.commit()
+        except sqlite3.IntegrityError:
+            stored_path.unlink(missing_ok=True)
+            existing = db.execute("SELECT id FROM source_documents WHERE sha256 = ?", (digest,)).fetchone()
+            raise HTTPException(
+                status_code=409,
+                detail=f"This document is already recorded as {existing['id'] if existing else 'an existing record'}",
+            ) from None
     return {"id": identifier, "issuer": issuer.strip(), "page_count": page_count, "sha256": digest}
 
 
@@ -310,8 +373,12 @@ def change_outreach_state(outreach_id: str, payload: OutreachStateChange) -> dic
         item = db.execute("SELECT * FROM outreach WHERE id = ?", (outreach_id,)).fetchone()
         if item is None:
             raise HTTPException(status_code=404, detail="Outreach record not found")
-        if payload.state == "sent" and item["state"] != "approved":
-            raise HTTPException(status_code=409, detail="Only approved outreach may be marked sent")
+        current_state = item["state"]
+        if payload.state not in OUTREACH_TRANSITIONS.get(current_state, set()):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot move outreach from {current_state} to {payload.state}",
+            )
         db.execute(
             "UPDATE outreach SET state = ?, state_note = ?, updated_at = ? WHERE id = ?",
             (payload.state, payload.note, utc_now(), outreach_id),
