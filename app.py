@@ -379,10 +379,15 @@ def change_outreach_state(outreach_id: str, payload: OutreachStateChange) -> dic
                 status_code=409,
                 detail=f"Cannot move outreach from {current_state} to {payload.state}",
             )
-        db.execute(
-            "UPDATE outreach SET state = ?, state_note = ?, updated_at = ? WHERE id = ?",
-            (payload.state, payload.note, utc_now(), outreach_id),
+        cursor = db.execute(
+            "UPDATE outreach SET state = ?, state_note = ?, updated_at = ? WHERE id = ? AND state = ?",
+            (payload.state, payload.note, utc_now(), outreach_id, current_state),
         )
+        if cursor.rowcount == 0:
+            raise HTTPException(
+                status_code=409,
+                detail="Outreach state changed concurrently; reload and retry",
+            )
         db.commit()
         return dict(db.execute("SELECT * FROM outreach WHERE id = ?", (outreach_id,)).fetchone())
 
