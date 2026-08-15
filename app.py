@@ -17,7 +17,7 @@ from uuid import uuid4
 
 import fitz
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, status
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -96,6 +96,56 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="Flurp V1", version="0.1.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
+
+
+def _too_large_detail() -> str:
+    return f"Request body exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)}MB limit"
+
+
+class MaxBodySizeMiddleware:
+    """Reject oversized request bodies while the ASGI server is still
+    receiving them, before Starlette's multipart parser can spool an
+    unbounded upload into a temporary file on disk.
+
+    Raises HTTPException (rather than a custom exception type) from
+    limited_receive because FastAPI wraps its own request.form()/request.json()
+    calls in a broad except-Exception clause that reformats anything else into
+    a generic 400 -- HTTPException is the one type it explicitly re-raises
+    unchanged, so it reaches Starlette's default HTTPException handler intact.
+    """
+
+    def __init__(self, asgi_app) -> None:
+        self.asgi_app = asgi_app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.asgi_app(scope, receive, send)
+            return
+
+        for name, value in scope.get("headers", []):
+            if name == b"content-length":
+                declared = int(value) if value.isdigit() else None
+                if declared is not None and declared > MAX_UPLOAD_BYTES:
+                    response = JSONResponse(status_code=413, content={"detail": _too_large_detail()})
+                    await response(scope, receive, send)
+                    return
+                break
+
+        received = 0
+
+        async def limited_receive():
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > MAX_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail=_too_large_detail())
+            return message
+
+        await self.asgi_app(scope, limited_receive, send)
+
+
+app.add_middleware(MaxBodySizeMiddleware)
 
 
 class LeadCreate(BaseModel):

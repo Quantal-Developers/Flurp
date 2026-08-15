@@ -68,11 +68,48 @@ def test_future_filing_date_is_rejected(client) -> None:
     assert upload(client, filing_date=future).status_code == 422
 
 
-def test_oversized_upload_is_rejected(client, monkeypatch) -> None:
+def test_oversized_upload_is_rejected_before_reaching_the_handler(client, monkeypatch) -> None:
+    """The Content-Length-declared body size must be rejected by the ASGI
+    middleware -- before Starlette's multipart parser spools it to disk --
+    not merely by the handler re-reading an already-buffered upload."""
     monkeypatch.setattr(app_module, "MAX_UPLOAD_BYTES", 10)
     response = upload(client)
-    assert response.status_code == 422
-    assert "MB upload limit" in response.json()["detail"]
+    assert response.status_code == 413
+    assert "MB limit" in response.json()["detail"]
+
+
+def test_streamed_upload_without_content_length_is_cut_off(client, monkeypatch) -> None:
+    """A request with no Content-Length header (chunked transfer, or a client
+    that lies about the header) must still be rejected once the ASGI layer's
+    running byte count crosses the limit -- not just the declared-size case."""
+    monkeypatch.setattr(app_module, "MAX_UPLOAD_BYTES", 200)
+    boundary = "X"
+    preamble = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="issuer"\r\n\r\nAcme\r\n'
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="document_type"\r\n\r\nDRHP\r\n'
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="filing_date"\r\n\r\n2026-08-01\r\n'
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="file"; filename="big.pdf"\r\n'
+        "Content-Type: application/pdf\r\n\r\n"
+        "%PDF-1.4\n"
+    ).encode()
+
+    def body_chunks():
+        yield preamble
+        for _ in range(10):  # far more than the 200-byte cap once combined with the preamble
+            yield b"A" * 100
+
+    response = client.post(
+        "/api/documents/upload",
+        content=body_chunks(),
+        headers={"content-type": f"multipart/form-data; boundary={boundary}"},
+    )
+    assert "content-length" not in {k.lower() for k in response.request.headers.keys()}
+    assert response.status_code == 413
+    assert "MB limit" in response.json()["detail"]
 
 
 def test_outreach_cannot_leave_a_terminal_state(client) -> None:
