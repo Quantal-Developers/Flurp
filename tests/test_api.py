@@ -26,6 +26,15 @@ def make_pdf(text: str = "Jane Doe, Chief Financial Officer, holds 50000 shares.
     return content
 
 
+def make_encrypted_pdf(user_pw: str) -> bytes:
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "Jane Doe, Chief Financial Officer, holds 50000 shares.")
+    content = doc.tobytes(encryption=fitz.PDF_ENCRYPT_AES_256, owner_pw="owner", user_pw=user_pw)
+    doc.close()
+    return content
+
+
 def upload(client, content: bytes | None = None, **overrides):
     data = {
         "issuer": "Acme Ltd",
@@ -66,6 +75,22 @@ def test_duplicate_upload_is_rejected(client) -> None:
 def test_future_filing_date_is_rejected(client) -> None:
     future = (date.today() + timedelta(days=1)).isoformat()
     assert upload(client, filing_date=future).status_code == 422
+
+
+def test_password_required_pdf_is_rejected(client) -> None:
+    response = upload(client, content=make_encrypted_pdf(user_pw="secret"))
+    assert response.status_code == 422
+    assert "encrypted" in response.json()["detail"].lower()
+
+
+def test_owner_password_only_pdf_is_rejected(client) -> None:
+    """PyMuPDF auto-authenticates a PDF with an empty user password (e.g. an
+    owner-password-only file) and then reports is_encrypted=False -- the
+    check must use a persistent indicator (needs_pass/metadata) instead, or
+    this file would be silently accepted."""
+    response = upload(client, content=make_encrypted_pdf(user_pw=""))
+    assert response.status_code == 422
+    assert "encrypted" in response.json()["detail"].lower()
 
 
 def test_oversized_upload_is_rejected_before_reaching_the_handler(client, monkeypatch) -> None:

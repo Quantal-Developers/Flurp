@@ -316,7 +316,12 @@ def upload_document(
     except (fitz.FileDataError, RuntimeError) as error:
         raise HTTPException(status_code=422, detail="The file is not a readable PDF") from error
     try:
-        if pdf.is_encrypted:
+        # is_encrypted reflects post-authentication accessibility: PyMuPDF auto-
+        # authenticates with an empty user password (e.g. owner-password-only
+        # PDFs) and then reports is_encrypted=False even though the file is
+        # encrypted. needs_pass/metadata reflect the file's actual encryption
+        # state regardless of that auto-authentication.
+        if pdf.needs_pass or (pdf.metadata or {}).get("encryption"):
             raise HTTPException(
                 status_code=422,
                 detail="Password-protected or encrypted PDFs are not supported in V1",
