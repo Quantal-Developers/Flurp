@@ -1,44 +1,40 @@
-# Flurp
+# Flurp — Pre-IPO executive signal prototype
 
-## Overview
-Flurp is an AI-powered bot designed for summarizing conference calls using Gemini. It allows users to upload a PDF file containing meeting transcripts, extracts text from it, does the summarization using the pre defined prompts and then displays the summarized output in a structured Markdown format.
+Flurp is an evidence-first local prototype for researching executives and
+material shareholders disclosed in public DRHP/RHP filings. It ranks research
+priority and records human-reviewed enrichment and outreach state.
 
-## Features
-- Upload a single PDF file
-- Save the uploaded file locally
-- Extract text from the PDF
-- Summraize the text and display the output
-- Uses Streamlit for an interactive UI
+It is **not** an automatic prospecting sender, does not scrape LinkedIn, does
+not call Apollo, and does not claim to know individual IPO allocations.
 
-## Installation
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/your-repo/flurp.git
-   cd flurp
-   ```
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. Run the application:
-   ```bash
-   streamlit run app.py
-   ```
+Read [the V1 scope and data contract](docs/v1-scope-and-data-contract.md)
+before adding integrations or automation.
 
-## Usage
-1. Open the Streamlit web interface.
-2. Upload a PDF containing the meeting transcript.
-3. The summarized text will be displayed in Markdown format.
+## Run locally
 
-## Technologies Used
-- **Python**
-- **Streamlit**
-- **pdfplumber** (for text extraction)
-- **Gemini AI** (for summarization)
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn app:app --reload
+```
 
-## Contributing
-Feel free to contribute by submitting issues or pull requests.
+Open <http://127.0.0.1:8000>. The prototype stores its SQLite database under
+`data/` and PDFs under `uploads/`; both are ignored by Git.
 
-## License
-This project is licensed under the MIT License.
+## Workflow
 
+1. Upload one DRHP/RHP PDF and record its filing date.
+2. Add only candidates backed by a PDF page number and verbatim quote.
+3. Review any enrichment evidence before adding contact details.
+4. Create a draft, explicitly approve it, then log sent/replied/bounced/opted-out states.
+
+The API never sends email. That integration needs a separately approved consent,
+suppression, and mailbox-authentication design.
+
+## Checks
+
+```bash
+pytest -q
+python -m compileall -q app.py tests
+```

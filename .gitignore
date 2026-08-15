@@ -1,15 +1,6 @@
-# Byte-compiled / optimized / DLL files
 __pycache__/
-
-# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
-__pypackages__/
-
-# Environments
-.env
+.pytest_cache/
 .venv/
-
-# PyCharm
-.idea/
-
-# Documents
-docs/*
+.env
+data/
+uploads/

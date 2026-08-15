@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Flurp — Pre-IPO signals</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <main>
+    <header><p class="eyebrow">V1 · Human-approved research</p><h1>Flurp</h1><p>Evidence-first pre-IPO executive signals. No automated enrichment or sending.</p></header>
+    <section class="card"><h2>1. Record a public filing</h2>
+      <form id="upload-form"><input name="issuer" placeholder="Issuer legal name" required><select name="document_type"><option>DRHP</option><option>RHP</option></select><input name="filing_date" type="date" required><input name="file" type="file" accept="application/pdf" required><button>Upload and extract text</button></form>
+      <p id="upload-result" class="notice"></p>
+    </section>
+    <section class="card"><h2>2. Add a sourced candidate</h2>
+      <form id="lead-form"><select name="document_id" id="document-select" required></select><input name="name" placeholder="Name exactly as disclosed" required><input name="role" placeholder="Role exactly as disclosed" required><input name="disclosed_shares" type="number" min="0" placeholder="Disclosed pre-IPO shares (optional)"><input name="price_per_share" type="number" min="0" step="0.01" placeholder="Exercise/allotment price (optional)"><input name="price_label" placeholder="Price label, e.g. exercise price"><input name="evidence_page" type="number" min="1" placeholder="PDF page" required><textarea name="evidence_quote" placeholder="Verbatim quote from the filing" required></textarea><button>Add evidence-backed candidate</button></form>
+      <p id="lead-result" class="notice"></p>
+    </section>
+    <section class="card"><h2>Research queue</h2><p>Scores prioritize research. They do not estimate wealth, intent, or suitability.</p><div id="lead-list">Loading…</div></section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>
