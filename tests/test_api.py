@@ -1,7 +1,8 @@
 from contextlib import closing
-from datetime import date, timedelta
+from datetime import timedelta
 
 import app as app_module
+from app import today_in_filing_timezone
 from helpers import add_lead, make_encrypted_pdf, make_pdf, upload
 
 
@@ -19,8 +20,13 @@ def test_duplicate_upload_is_rejected(client) -> None:
 
 
 def test_future_filing_date_is_rejected(client) -> None:
-    future = (date.today() + timedelta(days=1)).isoformat()
+    future = (today_in_filing_timezone() + timedelta(days=1)).isoformat()
     assert upload(client, filing_date=future).status_code == 422
+
+
+def test_filing_dated_today_in_the_filing_timezone_is_accepted(client) -> None:
+    filing_today = today_in_filing_timezone().isoformat()
+    assert upload(client, filing_date=filing_today).status_code == 201
 
 
 def test_password_required_pdf_is_rejected(client) -> None:

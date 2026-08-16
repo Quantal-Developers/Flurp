@@ -1,6 +1,6 @@
-from datetime import date
-
 import fitz
+
+from app import today_in_filing_timezone
 
 
 def make_pdf(text: str = "Jane Doe, Chief Financial Officer, holds 50000 shares.") -> bytes:
@@ -34,7 +34,7 @@ def upload(client, content: bytes | None = None, **overrides):
     data = {
         "issuer": "Acme Ltd",
         "document_type": "DRHP",
-        "filing_date": date.today().isoformat(),
+        "filing_date": today_in_filing_timezone().isoformat(),
     }
     data.update(overrides)
     files = {"file": ("filing.pdf", content if content is not None else make_pdf(), "application/pdf")}

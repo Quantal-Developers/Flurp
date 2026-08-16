@@ -1,5 +1,4 @@
-from datetime import date
-
+from app import today_in_filing_timezone
 from helpers import make_blank_pdf, make_pdf, upload
 
 
@@ -24,7 +23,7 @@ def test_unknown_document_type_is_rejected(client) -> None:
 def test_non_pdf_filename_is_rejected(client) -> None:
     response = client.post(
         "/api/documents/upload",
-        data={"issuer": "Acme Ltd", "document_type": "DRHP", "filing_date": date.today().isoformat()},
+        data={"issuer": "Acme Ltd", "document_type": "DRHP", "filing_date": today_in_filing_timezone().isoformat()},
         files={"file": ("filing.txt", make_pdf(), "text/plain")},
     )
     assert response.status_code == 422
