@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import sqlite3
 from contextlib import asynccontextmanager, closing
 from datetime import date, datetime, timezone
@@ -16,13 +17,17 @@ from uuid import uuid4
 
 import fitz
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, status
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 DATABASE_PATH = Path(os.getenv("FLURP_DATABASE_PATH", "data/flurp.db"))
 UPLOAD_DIRECTORY = Path("uploads")
 DOCUMENT_TYPES = {"DRHP", "RHP"}
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+UPLOAD_CHUNK_BYTES = 1024 * 1024
+PDF_HEADER = b"%PDF-"
+PDF_HEADER_SCAN_WINDOW = 1024
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -93,6 +98,56 @@ app = FastAPI(title="Flurp V1", version="0.1.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 
 
+def _too_large_detail() -> str:
+    return f"Request body exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)}MB limit"
+
+
+class MaxBodySizeMiddleware:
+    """Reject oversized request bodies while the ASGI server is still
+    receiving them, before Starlette's multipart parser can spool an
+    unbounded upload into a temporary file on disk.
+
+    Raises HTTPException (rather than a custom exception type) from
+    limited_receive because FastAPI wraps its own request.form()/request.json()
+    calls in a broad except-Exception clause that reformats anything else into
+    a generic 400 -- HTTPException is the one type it explicitly re-raises
+    unchanged, so it reaches Starlette's default HTTPException handler intact.
+    """
+
+    def __init__(self, asgi_app) -> None:
+        self.asgi_app = asgi_app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.asgi_app(scope, receive, send)
+            return
+
+        for name, value in scope.get("headers", []):
+            if name == b"content-length":
+                declared = int(value) if value.isdigit() else None
+                if declared is not None and declared > MAX_UPLOAD_BYTES:
+                    response = JSONResponse(status_code=413, content={"detail": _too_large_detail()})
+                    await response(scope, receive, send)
+                    return
+                break
+
+        received = 0
+
+        async def limited_receive():
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > MAX_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail=_too_large_detail())
+            return message
+
+        await self.asgi_app(scope, limited_receive, send)
+
+
+app.add_middleware(MaxBodySizeMiddleware)
+
+
 class LeadCreate(BaseModel):
     document_id: str
     name: str = Field(min_length=2, max_length=160)
@@ -120,13 +175,27 @@ class OutreachStateChange(BaseModel):
     note: str | None = Field(default=None, max_length=1000)
 
 
+OUTREACH_TRANSITIONS: dict[str, set[str]] = {
+    "draft": {"approved", "opted_out"},
+    "approved": {"sent", "opted_out"},
+    "sent": {"replied", "bounced", "opted_out"},
+    "replied": {"opted_out"},
+    "bounced": set(),
+    "opted_out": set(),
+}
+
+
+def _has_word(text: str, phrase: str) -> bool:
+    return re.search(rf"\b{re.escape(phrase)}\b", text) is not None
+
+
 def role_points(role: str) -> int:
     lower = role.lower()
-    if any(word in lower for word in ("chief", "ceo", "cfo", "coo", "cto", "founder", "managing director")):
+    if any(_has_word(lower, word) for word in ("chief", "ceo", "cfo", "coo", "cto", "founder", "managing director")):
         return 25
-    if any(word in lower for word in ("vice president", "vp", "director", "head of")):
+    if any(_has_word(lower, word) for word in ("vice president", "vp", "director", "head of")):
         return 18
-    if any(word in lower for word in ("manager", "lead", "principal")):
+    if any(_has_word(lower, word) for word in ("manager", "lead", "principal")):
         return 10
     return 5
 
@@ -144,13 +213,12 @@ def share_points(disclosed_shares: int | None) -> int:
 
 
 def freshness_points(filing_date: str) -> tuple[int, bool]:
-    days_old = max(0, (date.today() - date.fromisoformat(filing_date)).days)
+    """"Fresh" per the V1 data contract is within 72 hours (3 days); older is stale."""
+    days_old = (date.today() - date.fromisoformat(filing_date)).days
     if days_old <= 1:
         return 15, False
     if days_old <= 3:
         return 10, False
-    if days_old <= 7:
-        return 5, False
     return 0, True
 
 
@@ -197,11 +265,34 @@ def health() -> dict[str, str]:
 @app.get("/api/documents")
 def list_documents() -> list[dict]:
     with closing(connection()) as db:
-        return [dict(row) for row in db.execute("SELECT * FROM source_documents ORDER BY filing_date DESC").fetchall()]
+        rows = db.execute(
+            """SELECT id, issuer, document_type, filing_date, original_filename, sha256, page_count, created_at
+               FROM source_documents ORDER BY filing_date DESC"""
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def _read_upload_within_limit(upload: UploadFile, limit: int) -> bytes:
+    """Read the underlying file synchronously, aborting as soon as the running
+    total exceeds the limit instead of buffering an unbounded body first."""
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = upload.file.read(UPLOAD_CHUNK_BYTES)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            raise HTTPException(
+                status_code=422,
+                detail=f"The PDF exceeds the {limit // (1024 * 1024)}MB upload limit",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 @app.post("/api/documents/upload", status_code=status.HTTP_201_CREATED)
-async def upload_document(
+def upload_document(
     issuer: Annotated[str, Form(min_length=2, max_length=160)],
     document_type: Annotated[str, Form()],
     filing_date: Annotated[date, Form()],
@@ -209,20 +300,39 @@ async def upload_document(
 ) -> dict:
     if document_type not in DOCUMENT_TYPES:
         raise HTTPException(status_code=422, detail="document_type must be DRHP or RHP")
+    if filing_date > date.today():
+        raise HTTPException(status_code=422, detail="filing_date cannot be in the future")
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=422, detail="A PDF filing is required")
 
-    content = await file.read()
+    content = _read_upload_within_limit(file, MAX_UPLOAD_BYTES)
     if not content:
         raise HTTPException(status_code=422, detail="The uploaded PDF is empty")
+    if PDF_HEADER not in content[:PDF_HEADER_SCAN_WINDOW]:
+        raise HTTPException(status_code=422, detail="The file is not a readable PDF")
     digest = hashlib.sha256(content).hexdigest()
     try:
         pdf = fitz.open(stream=content, filetype="pdf")
-        extracted_text = "\n".join(page.get_text() for page in pdf)
-        page_count = pdf.page_count
-        pdf.close()
     except (fitz.FileDataError, RuntimeError) as error:
         raise HTTPException(status_code=422, detail="The file is not a readable PDF") from error
+    try:
+        # is_encrypted reflects post-authentication accessibility: PyMuPDF auto-
+        # authenticates with an empty user password (e.g. owner-password-only
+        # PDFs) and then reports is_encrypted=False even though the file is
+        # encrypted. needs_pass/metadata reflect the file's actual encryption
+        # state regardless of that auto-authentication.
+        if pdf.needs_pass or (pdf.metadata or {}).get("encryption"):
+            raise HTTPException(
+                status_code=422,
+                detail="Password-protected or encrypted PDFs are not supported in V1",
+            )
+        try:
+            extracted_text = "\n".join(page.get_text() for page in pdf)
+        except Exception as error:
+            raise HTTPException(status_code=422, detail="The file is not a readable PDF") from error
+        page_count = pdf.page_count
+    finally:
+        pdf.close()
     if not extracted_text.strip():
         raise HTTPException(status_code=422, detail="The PDF has no extractable text; OCR is not in V1")
 
@@ -233,11 +343,19 @@ async def upload_document(
         if existing:
             raise HTTPException(status_code=409, detail=f"This document is already recorded as {existing['id']}")
         stored_path.write_bytes(content)
-        db.execute(
-            "INSERT INTO source_documents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (identifier, issuer.strip(), document_type, filing_date.isoformat(), file.filename, str(stored_path), digest, page_count, extracted_text, utc_now()),
-        )
-        db.commit()
+        try:
+            db.execute(
+                "INSERT INTO source_documents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (identifier, issuer.strip(), document_type, filing_date.isoformat(), file.filename, str(stored_path), digest, page_count, extracted_text, utc_now()),
+            )
+            db.commit()
+        except sqlite3.IntegrityError:
+            stored_path.unlink(missing_ok=True)
+            existing = db.execute("SELECT id FROM source_documents WHERE sha256 = ?", (digest,)).fetchone()
+            raise HTTPException(
+                status_code=409,
+                detail=f"This document is already recorded as {existing['id'] if existing else 'an existing record'}",
+            ) from None
     return {"id": identifier, "issuer": issuer.strip(), "page_count": page_count, "sha256": digest}
 
 
@@ -310,12 +428,21 @@ def change_outreach_state(outreach_id: str, payload: OutreachStateChange) -> dic
         item = db.execute("SELECT * FROM outreach WHERE id = ?", (outreach_id,)).fetchone()
         if item is None:
             raise HTTPException(status_code=404, detail="Outreach record not found")
-        if payload.state == "sent" and item["state"] != "approved":
-            raise HTTPException(status_code=409, detail="Only approved outreach may be marked sent")
-        db.execute(
-            "UPDATE outreach SET state = ?, state_note = ?, updated_at = ? WHERE id = ?",
-            (payload.state, payload.note, utc_now(), outreach_id),
+        current_state = item["state"]
+        if payload.state not in OUTREACH_TRANSITIONS.get(current_state, set()):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot move outreach from {current_state} to {payload.state}",
+            )
+        cursor = db.execute(
+            "UPDATE outreach SET state = ?, state_note = ?, updated_at = ? WHERE id = ? AND state = ?",
+            (payload.state, payload.note, utc_now(), outreach_id, current_state),
         )
+        if cursor.rowcount == 0:
+            raise HTTPException(
+                status_code=409,
+                detail="Outreach state changed concurrently; reload and retry",
+            )
         db.commit()
         return dict(db.execute("SELECT * FROM outreach WHERE id = ?", (outreach_id,)).fetchone())
 
