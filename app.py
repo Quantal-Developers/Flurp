@@ -14,6 +14,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Annotated, Literal
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import fitz
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, status
@@ -28,9 +29,18 @@ MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 UPLOAD_CHUNK_BYTES = 1024 * 1024
 PDF_HEADER = b"%PDF-"
 PDF_HEADER_SCAN_WINDOW = 1024
+# DRHP/RHP filings are dated in India, so "today" for freshness/future-date
+# checks must follow the filing's own calendar, not the server's local
+# (typically UTC, in Docker) date -- otherwise a same-day IST filing can be
+# rejected as "future-dated" for the first ~5.5 hours of its local day.
+FILING_TIMEZONE = ZoneInfo(os.getenv("FLURP_FILING_TIMEZONE", "Asia/Kolkata"))
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def today_in_filing_timezone() -> date:
+    return datetime.now(FILING_TIMEZONE).date()
 
 
 def connection() -> sqlite3.Connection:
@@ -214,7 +224,7 @@ def share_points(disclosed_shares: int | None) -> int:
 
 def freshness_points(filing_date: str) -> tuple[int, bool]:
     """"Fresh" per the V1 data contract is within 72 hours (3 days); older is stale."""
-    days_old = (date.today() - date.fromisoformat(filing_date)).days
+    days_old = (today_in_filing_timezone() - date.fromisoformat(filing_date)).days
     if days_old <= 1:
         return 15, False
     if days_old <= 3:
@@ -300,7 +310,7 @@ def upload_document(
 ) -> dict:
     if document_type not in DOCUMENT_TYPES:
         raise HTTPException(status_code=422, detail="document_type must be DRHP or RHP")
-    if filing_date > date.today():
+    if filing_date > today_in_filing_timezone():
         raise HTTPException(status_code=422, detail="filing_date cannot be in the future")
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=422, detail="A PDF filing is required")

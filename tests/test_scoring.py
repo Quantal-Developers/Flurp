@@ -1,6 +1,6 @@
-from datetime import date, timedelta
+from datetime import timedelta
 
-from app import freshness_points, role_points, share_points
+from app import freshness_points, role_points, share_points, today_in_filing_timezone
 
 
 def test_share_score_is_visible_and_bounded() -> None:
@@ -28,18 +28,18 @@ def test_old_filings_are_stale() -> None:
 
 
 def test_today_is_fresh() -> None:
-    score, stale = freshness_points(date.today().isoformat())
+    score, stale = freshness_points(today_in_filing_timezone().isoformat())
     assert score == 15
     assert stale is False
 
 
 def test_72_hour_boundary_is_still_fresh() -> None:
-    score, stale = freshness_points((date.today() - timedelta(days=3)).isoformat())
+    score, stale = freshness_points((today_in_filing_timezone() - timedelta(days=3)).isoformat())
     assert score == 10
     assert stale is False
 
 
 def test_past_72_hours_is_stale() -> None:
-    score, stale = freshness_points((date.today() - timedelta(days=4)).isoformat())
+    score, stale = freshness_points((today_in_filing_timezone() - timedelta(days=4)).isoformat())
     assert score == 0
     assert stale is True
