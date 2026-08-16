@@ -1,62 +1,8 @@
 from contextlib import closing
 from datetime import date, timedelta
 
-import fitz
-import pytest
-from fastapi.testclient import TestClient
-
 import app as app_module
-from app import app
-
-
-@pytest.fixture()
-def client(tmp_path, monkeypatch):
-    monkeypatch.setattr(app_module, "DATABASE_PATH", tmp_path / "flurp.db")
-    monkeypatch.setattr(app_module, "UPLOAD_DIRECTORY", tmp_path / "uploads")
-    with TestClient(app) as test_client:
-        yield test_client
-
-
-def make_pdf(text: str = "Jane Doe, Chief Financial Officer, holds 50000 shares.") -> bytes:
-    doc = fitz.open()
-    page = doc.new_page()
-    page.insert_text((72, 72), text)
-    content = doc.tobytes()
-    doc.close()
-    return content
-
-
-def make_encrypted_pdf(user_pw: str) -> bytes:
-    doc = fitz.open()
-    page = doc.new_page()
-    page.insert_text((72, 72), "Jane Doe, Chief Financial Officer, holds 50000 shares.")
-    content = doc.tobytes(encryption=fitz.PDF_ENCRYPT_AES_256, owner_pw="owner", user_pw=user_pw)
-    doc.close()
-    return content
-
-
-def upload(client, content: bytes | None = None, **overrides):
-    data = {
-        "issuer": "Acme Ltd",
-        "document_type": "DRHP",
-        "filing_date": date.today().isoformat(),
-    }
-    data.update(overrides)
-    files = {"file": ("filing.pdf", content or make_pdf(), "application/pdf")}
-    return client.post("/api/documents/upload", data=data, files=files)
-
-
-def add_lead(client, document_id):
-    return client.post(
-        "/api/leads",
-        json={
-            "document_id": document_id,
-            "name": "Jane Doe",
-            "role": "Chief Financial Officer",
-            "evidence_page": 1,
-            "evidence_quote": "Jane Doe, Chief Financial Officer, holds 50000 shares.",
-        },
-    ).json()
+from helpers import add_lead, make_encrypted_pdf, make_pdf, upload
 
 
 def test_document_list_excludes_internal_fields(client) -> None:
@@ -139,7 +85,7 @@ def test_streamed_upload_without_content_length_is_cut_off(client, monkeypatch) 
 
 def test_outreach_cannot_leave_a_terminal_state(client) -> None:
     doc = upload(client).json()
-    lead = add_lead(client, doc["id"])
+    lead = add_lead(client, doc["id"]).json()
     outreach = client.post(
         f"/api/leads/{lead['id']}/outreach",
         json={"message": "Hello, congratulations on the upcoming listing!"},
@@ -158,7 +104,7 @@ def test_outreach_state_change_is_atomic_under_a_race(client, monkeypatch) -> No
     overwrite -- the conditional UPDATE's WHERE id = ? AND state = ? must
     reject a stale write instead of blindly applying it."""
     doc = upload(client).json()
-    lead = add_lead(client, doc["id"])
+    lead = add_lead(client, doc["id"]).json()
     outreach = client.post(
         f"/api/leads/{lead['id']}/outreach",
         json={"message": "Hello, congratulations on the upcoming listing!"},
@@ -207,7 +153,7 @@ def test_outreach_state_change_is_atomic_under_a_race(client, monkeypatch) -> No
 
 def test_outreach_requires_approval_before_send(client) -> None:
     doc = upload(client).json()
-    lead = add_lead(client, doc["id"])
+    lead = add_lead(client, doc["id"]).json()
     outreach = client.post(
         f"/api/leads/{lead['id']}/outreach",
         json={"message": "Hello, congratulations on the upcoming listing!"},
